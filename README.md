@@ -91,13 +91,14 @@ Optional repository variables (defaults are already in the workflow):
 
 ## Cadence and expected volume
 
-**The schedule is currently paused** (`on.schedule` is commented out in
-`.github/workflows/archive.yml`) while the root migration runs, so this archiver stays a
-single writer. Re-enabling it is a deliberate step after `migrate_root.py` reports clean.
+Scheduled every 6 hours (`23 */6 * * *`), resumed on 2026-11-03 after the root migration and
+a three-batch test run reported `root_media_files 0`, `missing 0`, `dangling_refs 0`. The
+archiver is the only writer of `_worker/` state, which is why a migration is run while the
+schedule is off.
 
-When it is on: every 6 hours, one job, up to ~118 minutes of audio then ~100 of video, with
+Each run takes up to ~118 minutes of audio then ~100 of video, with
 `--commit-files 90` distinct objects per commit and `--min-commit-interval 25` (measured
-26-27 s per batch). Measured averages: audio 2.87 MB/asset over 32,344 assets (~93 GB), video
+26-29 s per batch). Measured averages: audio 2.87 MB/asset over 32,344 assets (~93 GB), video
 median 7.3 / mean 12.8 MB over 10,703 assets (~134 GB). Audio finishes first; video follows
 in the same job once its gate is open.
 

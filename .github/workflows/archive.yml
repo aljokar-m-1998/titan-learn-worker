@@ -6,9 +6,10 @@ name: archive VOA media into the dataset
 # two parallel writers would overwrite each other's resume state.
 
 on:
-  # PAUSED 2026-11-03 after run 41704396804: no new run until the owner approves the resume.
-  # schedule:
-  #   - cron: "23 */6 * * *"
+  # Resumed 2026-11-03 after the root migration: every directory is bucketed by SHA-256, the
+  # flat copies are gone, and a test batch committed three clean batches under this code.
+  schedule:
+    - cron: "23 */6 * * *"
   workflow_dispatch:
     inputs:
       kinds:
