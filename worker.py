@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import urllib.error
@@ -58,7 +59,8 @@ HOST_PRIORITY = {"voa-audio.voanews.eu": 0, "av.voanews.com": 1, "podcast.voanew
 
 
 def log(message: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+    # progress goes to stderr so stdout stays a single parseable JSON report
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True)
 
 
 def token() -> str:
