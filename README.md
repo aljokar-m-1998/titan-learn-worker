@@ -34,7 +34,10 @@ The repository contains code only - no VOA content - so publishing it exposes no
 git init -b main
 git add .
 git commit -m "VOA media archiver for the Titan Learn dataset"
-gh repo create M-hv1/titan-learn-worker --public --source=. --push
+# M-hv1 is the Hugging Face namespace; it is not a GitHub org, so the repo lives
+# under the GitHub account and writes into the M-hv1 dataset.
+gh repo create aljokar-m-1998/titan-learn-worker --public --source=. --push
+# read from the token file on stdin: the value is never printed or stored in git
 gh secret set HF_TOKEN < ~/.cache/huggingface/token
 ```
 
