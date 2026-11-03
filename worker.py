@@ -414,6 +414,32 @@ def _on_signal(signum, frame):
 STATE_HOOK: dict = {}
 
 
+def promote_pending_uploads(api, index: dict) -> int:
+    """A run that died after uploading but before confirming leaves assets unverified.
+
+    Confirming them from the hub's own metadata costs one request per 500 and stops the
+    next run from treating them as still to be done.
+    """
+    waiting = {key: row for key, row in index["assets"].items()
+               if row.get("status") == "uploaded_unverified"}
+    if not waiting:
+        return 0
+    remote = remote_oids(api, sorted({row["object"] for row in waiting.values()}))
+    promoted = 0
+    for key, row in waiting.items():
+        actual_sha, actual_bytes = remote.get(row["object"], ("", 0))
+        if actual_sha.lower() == row["sha256"] and (not actual_bytes or actual_bytes == row["bytes"]):
+            row["status"] = "verified_remote"
+            promoted += 1
+        else:
+            # absent or different remotely: this is a real failure, retried from source
+            row["status"] = "failed"
+            row["attempts"] = MAX_ATTEMPTS
+            row["error"] = f"uploaded_unverified never confirmed remotely ({actual_sha or 'missing'})"
+    log(f"promoted {promoted}/{len(waiting)} assets left unconfirmed by an earlier run")
+    return promoted
+
+
 def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: float,
         dry_run: bool, reserve_minutes: float = 10.0, commit_files: int = 90,
         max_commits_per_run: int = 30, max_commits_per_day: int = 120,
@@ -431,6 +457,7 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
     budget = Budget(api, max_commits_per_run, max_commits_per_day, min_commit_interval, min_remaining)
     index = load_state(api)
     refs = load_refs(api, kind)
+    promote_pending_uploads(api, index)
     queue = queue_from_shards(api, kind)
     STATE_HOOK.clear()
     STATE_HOOK.update({"api": api, "index": index, "refs": refs, "kind": kind,
@@ -460,16 +487,17 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
         # dynamic sizing: keep pulling candidates until this many DISTINCT new objects are
         # staged, so media plus state stays one commit inside the safe operations band
         jobs: list[dict] = []
-        seen_digests: set[str] = set()
+        new_digests: set[str] = set()
+        wave = max(workers, min(commit_files, 30))
         cursor = 0
         scanned = 0
-        while len(seen_digests) < commit_files and cursor < min(len(pending), batch_assets):
-            wave = pending[cursor:cursor + max(commit_files, workers)]
-            cursor += len(wave)
-            scanned += len(wave)
+        while len(new_digests) < commit_files and cursor < min(len(pending), batch_assets):
+            chunk = pending[cursor:cursor + wave]
+            cursor += len(chunk)
+            scanned += len(chunk)
             with futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                results = list(pool.map(lambda pair: pull(pair[1], stage), wave))
-            for (item_id, url), result in zip(wave, results):
+                results = list(pool.map(lambda pair: pull(pair[1], stage), chunk))
+            for (item_id, url), result in zip(chunk, results):
                 key = f"{item_id}:{kind}:{url}"
                 if result["status"] != "verified_local":
                     previous = index["assets"].get(key, {})
@@ -485,8 +513,20 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
                     continue
                 jobs.append({**result, "key": key, "item_id": item_id})
                 if result["sha256"] not in index["objects"]:
-                    seen_digests.add(result["sha256"])
-        fresh = {row["sha256"]: row for row in jobs if row["sha256"] not in index["objects"]}
+                    new_digests.add(result["sha256"])
+        # trim to exactly commit_files distinct NEW digests: several items can share one
+        # audio file, and without this a duplicate pushes the commit past the split point
+        accepted: set[str] = set()
+        kept: list[dict] = []
+        for row in jobs:
+            if row["sha256"] in index["objects"] or row["sha256"] in accepted:
+                kept.append(row)
+            elif len(accepted) < commit_files:
+                accepted.add(row["sha256"])
+                kept.append(row)
+        jobs = kept
+        fresh = {digest: next(row for row in jobs if row["sha256"] == digest)
+                 for digest in accepted}
         outcome = {"batch": batch_number, "candidates_scanned": scanned,
                    "verified_local": len(jobs), "new_objects": len(fresh)}
         if dry_run:
@@ -505,28 +545,25 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
             destination = Path(stage) / object_path(digest, row["local"])
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(row["local"], destination)
+        # one pass over every job: two items can reference the same audio file, and each
+        # of them needs its own asset line and ref row whether or not the bytes are new
         for row in jobs:
-            if row["sha256"] in fresh:
-                continue
-            path = object_path(row["sha256"], row["local"])
-            index["assets"][row["key"]] = {"url": row["url"], "status": "verified_remote",
-                                           "object": path, "sha256": row["sha256"],
-                                           "bytes": row["bytes"], "mime": row["mime"],
-                                           "reused_object": True}
-            refs.setdefault(row["item_id"], []).append(
-                {"kind": kind, "object": path, "sha256": row["sha256"], "bytes": row["bytes"],
-                 "mime": row["mime"], "source_url": row["url"]})
-        for digest, row in fresh.items():
-            index["objects"][digest] = {"object": object_path(digest, row["local"]),
-                                        "bytes": row["bytes"], "mime": row["mime"], "kind": kind,
-                                        "sha256": digest, "url": row["url"],
-                                        "archived_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-            index["assets"][row["key"]] = {"url": row["url"], "status": "uploaded_unverified",
-                                           "object": index["objects"][digest]["object"],
-                                           "sha256": digest, "bytes": row["bytes"], "mime": row["mime"]}
-            refs.setdefault(row["item_id"], []).append(
-                {"kind": kind, "object": index["objects"][digest]["object"], "sha256": digest,
-                 "bytes": row["bytes"], "mime": row["mime"], "source_url": row["url"]})
+            digest = row["sha256"]
+            path = object_path(digest, row["local"])
+            reused = digest in index["objects"]
+            if not reused:
+                index["objects"][digest] = {"object": path, "bytes": row["bytes"],
+                                            "mime": row["mime"], "kind": kind, "sha256": digest,
+                                            "url": row["url"],
+                                            "archived_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                                         time.gmtime())}
+            entry = {"url": row["url"], "object": path, "sha256": digest,
+                     "bytes": row["bytes"], "mime": row["mime"],
+                     "status": "verified_remote" if reused else "uploaded_unverified"}
+            if reused:
+                entry["reused_object"] = True
+            index["assets"][row["key"]] = entry
+            refs.setdefault(row["item_id"], []).append({"kind": kind, **entry})
         stage_state(stage, index, refs, kind, budget, len(fresh))
         # one commit: the batch's media files AND the resume state AND the budget report
         commit = api.upload_folder(repo_id=REPO, repo_type="dataset", folder_path=stage,

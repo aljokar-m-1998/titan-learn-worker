@@ -35,6 +35,11 @@ jobs:
   archive:
     runs-on: ubuntu-24.04
     timeout-minutes: 330
+    defaults:
+      # the default shell hides a pipeline's left-hand failure: `python … | tee` would
+      # report success even when the archiver died with a traceback
+      run:
+        shell: bash
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_LEARN_DATASET_REPO: ${{ vars.HF_LEARN_DATASET_REPO || 'M-hv1/Titan-Learn' }}
