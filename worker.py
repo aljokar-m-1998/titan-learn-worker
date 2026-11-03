@@ -511,6 +511,13 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
         if not allowed:
             return {"aborted": f"video gate closed: {why}"}
     budget = Budget(api, max_commits_per_run, min_commit_interval, min_remaining)
+    if reserve_minutes * 60 >= max_minutes * 60:
+        # with a reserve that swallows the whole step, no batch can ever start: saying so is
+        # the difference between a refused run and a green one that archived nothing
+        return {"kind": kind, "refused": f"max_minutes {max_minutes} must exceed reserve_minutes "
+                                         f"{reserve_minutes}, otherwise no batch can start",
+                "batches": [], "queue_assets": 0, "objects_total": 0, "asset_lines": 0,
+                "by_status": {}, "commit_budget": budget.report(kind), "minutes": 0.0}
     index = load_state(api)
     refs = load_refs(api, kind)
     promote_pending_uploads(api, index, refs)
