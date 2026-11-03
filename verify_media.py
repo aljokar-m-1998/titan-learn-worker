@@ -38,7 +38,8 @@ def all_remote_media_paths(api) -> set[str]:
             if path.startswith("media/")}
 
 
-def verify(kind: str, publish: bool) -> dict:
+def verify(kind: str, publish: bool, recent: int = 0) -> dict:
+    """`recent` bounds a between-batches sweep; only a full sweep can call the phase complete."""
     api = hf_api()
     index = json.loads(read_file(api, "_worker/media_index.json", revision=STATE_REVISION).decode("utf-8"))
     refs_raw = read_file(api, f"_worker/{kind}_refs.jsonl", revision=STATE_REVISION) or b""
@@ -51,7 +52,14 @@ def verify(kind: str, publish: bool) -> dict:
                           if index["assets"].get(f"{item_id}:{kind}:{url}", {}).get("status")
                           in ("failed", "quarantined"))
 
-    paths = sorted(obj["object"] for obj in objects.values() if obj.get("kind") == kind)
+    of_kind = {digest: obj for digest, obj in objects.items() if obj.get("kind") == kind}
+    scope = "full"
+    if recent and len(of_kind) > recent:
+        # newest first, so a partial sweep still covers exactly what just went in
+        scope = f"recent {recent}"
+        of_kind = dict(sorted(of_kind.items(), key=lambda kv: kv[1].get("archived_at") or "",
+                              reverse=True)[:recent])
+    paths = sorted(obj["object"] for obj in of_kind.values())
     remote = remote_oids(api, paths)
     match = mismatch = 0
     offenders: list[str] = []
@@ -82,6 +90,7 @@ def verify(kind: str, publish: bool) -> dict:
     report = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "kind": kind,
+        "scope": scope,
         "method": ("independent re-read of the dataset plus LFS metadata from the hub API; "
                    "the archiver's own counters are not trusted here"),
         "queue_total_assets": len(queue),
@@ -106,8 +115,9 @@ def verify(kind: str, publish: bool) -> dict:
         # completion additionally requires the queue drained with nothing unaccounted for
         "integrity_ok": mismatch == 0 and not missing_remotely and not dangling_refs,
         "all_match": mismatch == 0 and not missing_remotely and not dangling_refs,
-        "complete": (remaining == 0 and mismatch == 0 and not missing_remotely
-                     and not dangling_refs and not orphans),
+        # only a full sweep may declare the phase complete; a between-batches sweep cannot
+        "complete": (scope == "full" and remaining == 0 and mismatch == 0
+                     and not missing_remotely and not dangling_refs and not orphans),
         "complete_note": ("orphans are expected while a batch is mid-commit; re-run this check "
                           "once the queue is drained before trusting `complete`"
                           if orphans and remaining == 0 else ""),
@@ -128,8 +138,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--kind", default="audio", choices=("audio", "video"))
     parser.add_argument("--no-publish", action="store_true")
+    parser.add_argument("--recent", type=int, default=0,
+                        help="check only the newest N objects (a cheap between-batch sweep)")
     args = parser.parse_args()
-    report = verify(args.kind, not args.no_publish)
+    report = verify(args.kind, not args.no_publish, args.recent)
     print(json.dumps(report, ensure_ascii=False, indent=1))
     return 0 if report["integrity_ok"] else 1
 

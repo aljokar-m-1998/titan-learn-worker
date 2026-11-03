@@ -19,14 +19,10 @@ on:
           - audio,video
           - audio
           - video
-      batch_assets:
-        description: "assets per batch"
+      commit_files:
+        description: "distinct objects per commit (state rides along in the same commit)"
         required: false
-        default: "500"
-      batches:
-        description: "batches per kind"
-        required: false
-        default: "12"
+        default: "90"
 
 concurrency:
   group: voa-media-archiver
@@ -76,18 +72,20 @@ jobs:
                 "|", manifest["format"], "| round_trip", manifest["round_trip"]["round_trip_identical"])
           PY
 
-      - name: archive audio (resumes from _worker state; skips verified assets)
+      - name: archive audio (one commit per ~90 objects, state inside it)
         if: ${{ github.event.inputs.kinds != 'video' }}
         run: |
           python worker.py --kind audio \
-            --batches "${{ github.event.inputs.batches || '12' }}" \
-            --batch-assets "${{ github.event.inputs.batch_assets || '500' }}" \
-            --workers 8 --max-minutes 118 --reserve-minutes 15 | tee audio-run.json
+            --commit-files "${{ github.event.inputs.commit_files || '90' }}" --batches 40 \
+            --workers 8 --max-minutes 118 --reserve-minutes 15 \
+            --min-commit-interval 20 --min-remaining 150 \
+            --max-commits-per-run "${{ vars.MAX_COMMITS_PER_RUN || '30' }}" \
+            --max-commits-per-day "${{ vars.MAX_COMMITS_PER_DAY || '120' }}" | tee audio-run.json
 
-      - name: verify audio independently (publishes reports/audio_verify.json)
+      - name: sweep audio (bounded, between batches; the full sweep runs at completion)
         if: ${{ github.event.inputs.kinds != 'video' }}
         run: |
-          python verify_media.py --kind audio | tee audio-verify.json
+          python verify_media.py --kind audio --recent 500 | tee audio-verify.json
         # a non-zero exit here means an indexed object is absent or differs remotely,
         # which stops the job before any video bytes get pulled
 
@@ -95,14 +93,16 @@ jobs:
         if: ${{ github.event.inputs.kinds != 'audio' }}
         run: |
           python worker.py --kind video \
-            --batches "${{ github.event.inputs.batches || '12' }}" \
-            --batch-assets "${{ github.event.inputs.batch_assets || '300' }}" \
-            --workers 6 --max-minutes 100 --reserve-minutes 15 | tee video-run.json
+            --commit-files 60 --batches 40 \
+            --workers 6 --max-minutes 100 --reserve-minutes 15 \
+            --min-commit-interval 30 --min-remaining 200 \
+            --max-commits-per-run "${{ vars.MAX_COMMITS_PER_RUN || '25' }}" \
+            --max-commits-per-day "${{ vars.MAX_COMMITS_PER_DAY || '120' }}" | tee video-run.json
 
-      - name: verify video independently (publishes reports/video_verify.json)
+      - name: sweep video independently (publishes reports/video_verify.json)
         if: ${{ github.event.inputs.kinds != 'audio' }}
         run: |
-          python verify_media.py --kind video | tee video-verify.json
+          python verify_media.py --kind video --recent 150 | tee video-verify.json
 
       - name: upload this run's report
         if: always()
