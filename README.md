@@ -13,15 +13,52 @@ PULL from VOA -> temp file -> VERIFY (magic-byte MIME + declared size + SHA-256)
   -> WRITE resume state -> PURGE temp
 ```
 
-Two rules are enforced in code, not by convention:
+Three rules are enforced in code, not by convention:
 
 - **Nothing is fetched twice.** `_worker/media_index.json` records each asset's status; an
   asset at `verified_remote` is skipped, and a dead one stops after 3 attempts. So the
-  already-archived objects cost no bandwidth on the next run.
+  already-archived objects cost no bandwidth on the next run. An interrupted batch is rolled
+  back, so a `uploaded_unverified` line can only ever describe bytes the repository holds.
 - **Video cannot start without a measured size sample.** `--kind video` reads
   `reports/video_probe.json` and aborts unless it holds at least 30 successful HEADs and
   the decision `video archiving may start`. That gate is what produced the 134.1 GB
   estimate before any video was pulled.
+- **No directory may pass 10,000 files.** The hub rejects such a push with `400 Bad Request`,
+  which is a structural refusal, not a rate limit. Every staged path must therefore be
+  `media/<sha256[0:2]>/<sha256>.<ext>`, with state one level down in `_worker/` or
+  `reports/`; `misplaced()` checks this immediately before the commit and the run dies
+  instead of pushing flat files.
+
+## Root migration (2026-11-03)
+
+An earlier staging bug wrote downloads into the upload folder, so each batch also landed a
+flat copy named `sha256(url)[:20].mp3` in the repository root. Those copies reached 9,989 and
+the wall came down. `migrate_root.py` clears them without asking VOA for a single byte:
+
+```bash
+python -m migrate_root                        # plan only: counts and cases, publishes nothing
+python -m migrate_root --apply --per-commit 500 --max-commits 24
+```
+
+- `duplicate` - the branched object already exists; its SHA-256 and size are re-read from the
+  hub before the flat copy is deleted.
+- `copy` - the bytes exist only flat; they are read back **from the dataset**, re-verified,
+  committed to their SHA-bucketed path, indexed with their item and ref, and only then is the
+  flat copy dropped.
+- `conflict` / untraceable - left exactly where it is and reported. Never merged, never deleted.
+
+Deletions ride with a progress checkpoint, and one closing commit carries the full resume
+state. Because what is left is always re-derived from the tree, an interrupted migration
+simply resumes. `audit()` prints the five numbers that decide whether the phase is closed:
+`root_media_files`, `folders_over_limit`, `missing`, `checksum_mismatch`, `dangling_refs`.
+
+## Commit policy
+
+There is no assumed daily ceiling - the hub's own answer decides. A run stops on a low rate
+window (`--min-remaining`), on `--max-commits-per-run`, or when the hub actually refuses it.
+Only a 429 or a quota refusal schedules `_worker/backoff.json`; a structural refusal stops
+the run and exits non-zero without marking any file failed.
+
 
 ## Setup (one time)
 
@@ -54,8 +91,13 @@ Optional repository variables (defaults are already in the workflow):
 
 ## Cadence and expected volume
 
-Scheduled every 6 hours, up to ~145 minutes per media type, 500 audio or 300 video assets
-per batch. Measured averages: audio 2.87 MB/asset over 32,344 assets (~93 GB), video
+**The schedule is currently paused** (`on.schedule` is commented out in
+`.github/workflows/archive.yml`) while the root migration runs, so this archiver stays a
+single writer. Re-enabling it is a deliberate step after `migrate_root.py` reports clean.
+
+When it is on: every 6 hours, one job, up to ~118 minutes of audio then ~100 of video, with
+`--commit-files 90` distinct objects per commit and `--min-commit-interval 25` (measured
+26-27 s per batch). Measured averages: audio 2.87 MB/asset over 32,344 assets (~93 GB), video
 median 7.3 / mean 12.8 MB over 10,703 assets (~134 GB). Audio finishes first; video follows
 in the same job once its gate is open.
 
