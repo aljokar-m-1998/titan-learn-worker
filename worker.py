@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO = os.environ.get("HF_LEARN_DATASET_REPO", "M-hv1/Titan-Learn")
 WRITE_REVISION = os.environ.get("HF_LEARN_DATASET_REVISION", "staging")
@@ -197,6 +197,18 @@ def object_path(digest: str, local: str) -> str:
     return f"media/{digest[0:2]}/{digest}{suffix}"
 
 
+def misplaced(name: str) -> bool:
+    """True when a staged path is not SHA-bucketed media or a state file one level down.
+
+    The hub caps a directory at 10000 files, and the flat root is what filled it once, so
+    media may only live at media/<sha[:2]>/<sha>.<ext> and state at _worker/ or reports/.
+    """
+    parts = PurePosixPath(name).parts
+    if parts[0] == "media":
+        return len(parts) != 3 or len(parts[1]) != 2
+    return parts[0] not in ("_worker", "reports") or len(parts) != 2
+
+
 def remote_oids(api, paths: list[str]) -> dict[str, tuple[str, int]]:
     found: dict[str, tuple[str, int]] = {}
     for index, start in enumerate(range(0, len(paths), 500)):
@@ -266,11 +278,10 @@ class Budget:
     operator's precaution: they stop before a limit is reached rather than discovering it.
     """
 
-    def __init__(self, api, max_per_run: int, max_per_day: int, min_interval: float,
+    def __init__(self, api, max_per_run: int, min_interval: float,
                  min_remaining: int) -> None:
         self.api = api
         self.max_per_run = max_per_run
-        self.max_per_day = max_per_day
         self.min_interval = min_interval
         self.min_remaining = min_remaining
         self.used = 0
@@ -311,9 +322,8 @@ class Budget:
         if remaining is not None and remaining < self.min_remaining:
             return (f"rate window low: remaining={remaining} "
                     f"reset_in={self.state.get('reset_in')}s of q={self.state.get('quota')}")
-        day = self.commits_last_24h()
-        if day >= self.max_per_day:
-            return f"max_commits_per_day reached ({day} in 24h, cap {self.max_per_day})"
+        # No assumed daily ceiling: the measured window and the hub's own refusals decide.
+        # commits_last_24h() stays in the report as observation only.
         return ""
 
     def allow_ignoring_pacing(self) -> str:
@@ -340,7 +350,6 @@ class Budget:
             "commits_this_run": self.used,
             "commits_last_24h": self.commits_last_24h(),
             "cap_commits_per_run": self.max_per_run,
-            "cap_commits_per_day": self.max_per_day,
             "min_commit_interval_seconds": self.min_interval,
             "files_uploaded_this_run": self.files,
             "bytes_uploaded_this_run": self.bytes,
@@ -414,7 +423,7 @@ def _on_signal(signum, frame):
 STATE_HOOK: dict = {}
 
 
-def promote_pending_uploads(api, index: dict) -> int:
+def promote_pending_uploads(api, index: dict, refs: dict[str, list[dict]]) -> int:
     """A run that died after uploading but before confirming leaves assets unverified.
 
     Confirming them from the hub's own metadata costs one request per 500 and stops the
@@ -427,22 +436,69 @@ def promote_pending_uploads(api, index: dict) -> int:
     remote = remote_oids(api, sorted({row["object"] for row in waiting.values()}))
     promoted = 0
     for key, row in waiting.items():
+        item_id = key.split(":")[0]
         actual_sha, actual_bytes = remote.get(row["object"], ("", 0))
         if actual_sha.lower() == row["sha256"] and (not actual_bytes or actual_bytes == row["bytes"]):
             row["status"] = "verified_remote"
             promoted += 1
+            continue
+        # The bytes are not in the repo, so this is our own interrupted commit, not a dead
+        # provider URL: keep it retryable and forget the object line, otherwise the next
+        # batch would call missing bytes "reused" and the index would claim an object that
+        # was never committed.
+        row["status"] = "upload_incomplete"
+        row["attempts"] = 1
+        row["error"] = f"indexed object not confirmed remotely ({actual_sha or 'missing'})"
+        index["objects"].pop(row["sha256"], None)
+        kept = [entry for entry in refs.get(item_id, []) if entry["sha256"] != row["sha256"]]
+        if kept:
+            refs[item_id] = kept
         else:
-            # absent or different remotely: this is a real failure, retried from source
-            row["status"] = "failed"
-            row["attempts"] = MAX_ATTEMPTS
-            row["error"] = f"uploaded_unverified never confirmed remotely ({actual_sha or 'missing'})"
+            refs.pop(item_id, None)
     log(f"promoted {promoted}/{len(waiting)} assets left unconfirmed by an earlier run")
     return promoted
 
 
+def snapshot(index: dict, refs: dict, fresh: dict, jobs: list[dict]) -> dict:
+    """What the keys this batch is about to overwrite currently hold, so a refusal undoes it."""
+    touched_items: dict[str, list[dict] | None] = {}
+    for row in jobs:
+        item_id = row["item_id"]
+        if item_id not in touched_items:
+            touched_items[item_id] = list(refs[item_id]) if item_id in refs else None
+    return {"objects": {digest: index["objects"].get(digest) for digest in fresh},
+            "assets": {row["key"]: index["assets"].get(row["key"]) for row in jobs},
+            "refs": touched_items}
+
+
+def rollback(index: dict, refs: dict, saved: dict) -> None:
+    for digest, previous in saved["objects"].items():
+        if previous is None:
+            index["objects"].pop(digest, None)
+        else:
+            index["objects"][digest] = previous
+    for key, previous in saved["assets"].items():
+        if previous is None:
+            index["assets"].pop(key, None)
+        else:
+            index["assets"][key] = previous
+    for item_id, previous in saved["refs"].items():
+        if previous is None:
+            refs.pop(item_id, None)
+        else:
+            refs[item_id] = previous
+
+
+def looks_like_quota(message: str) -> bool:
+    """Only the hub's own refusal words may turn a stop into a wait."""
+    lowered = message.lower()
+    return any(marker in lowered for marker in
+               ("429", "rate limit", "rate-limit", "retry-after", "too many requests", "quota"))
+
+
 def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: float,
         dry_run: bool, reserve_minutes: float = 10.0, commit_files: int = 90,
-        max_commits_per_run: int = 30, max_commits_per_day: int = 120,
+        max_commits_per_run: int = 30,
         min_commit_interval: float = 20.0, min_remaining: int = 150) -> dict:
     api = hf_api()
     until = backoff_until(api)
@@ -454,10 +510,10 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
         allowed, why = video_gate_allowed(api)
         if not allowed:
             return {"aborted": f"video gate closed: {why}"}
-    budget = Budget(api, max_commits_per_run, max_commits_per_day, min_commit_interval, min_remaining)
+    budget = Budget(api, max_commits_per_run, min_commit_interval, min_remaining)
     index = load_state(api)
     refs = load_refs(api, kind)
-    promote_pending_uploads(api, index)
+    promote_pending_uploads(api, index, refs)
     queue = queue_from_shards(api, kind)
     STATE_HOOK.clear()
     STATE_HOOK.update({"api": api, "index": index, "refs": refs, "kind": kind,
@@ -468,6 +524,7 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
     history: list[dict] = []
     last_batch_seconds = 0.0
     dirty = False
+    refused = ""
     for batch_number in range(1, batches + 1):
         # the margin is adaptive: a batch only starts if the measured length of the last
         # one still fits, plus a reserve, before this step's deadline
@@ -484,6 +541,15 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
             break
         batch_start = time.time()
         stage = tempfile.mkdtemp(prefix=f"voa-{kind}-")
+        # Downloads never touch the upload stage: a file sitting at the stage root is
+        # committed to the repo root, and the hub refuses any push that takes one directory
+        # past 10000 files. That refusal is what killed the audio run on 2026-11-03.
+        scratch = tempfile.mkdtemp(prefix=f"voa-dl-{kind}-")
+
+        def discard() -> None:
+            for directory in (stage, scratch):
+                shutil.rmtree(directory, ignore_errors=True)
+
         # dynamic sizing: keep pulling candidates until this many DISTINCT new objects are
         # staged, so media plus state stays one commit inside the safe operations band
         jobs: list[dict] = []
@@ -496,7 +562,7 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
             cursor += len(chunk)
             scanned += len(chunk)
             with futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                results = list(pool.map(lambda pair: pull(pair[1], stage), chunk))
+                results = list(pool.map(lambda pair: pull(pair[1], scratch), chunk))
             for (item_id, url), result in zip(chunk, results):
                 key = f"{item_id}:{kind}:{url}"
                 if result["status"] != "verified_local":
@@ -530,17 +596,20 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
         outcome = {"batch": batch_number, "candidates_scanned": scanned,
                    "verified_local": len(jobs), "new_objects": len(fresh)}
         if dry_run:
-            shutil.rmtree(stage, ignore_errors=True)
+            discard()
             history.append({**outcome, "dry_run": True})
             break
         block = budget.allow()
         if block:
-            shutil.rmtree(stage, ignore_errors=True)
+            discard()
             budget.stop_reason = block
             history.append({**outcome, "commit_blocked": block})
             save_backoff(api, kind, budget)
             dirty = False  # the backoff commit already carried the state
             break
+        # captured before anything is mutated: a refused commit must be able to put these
+        # keys back exactly as the repository still holds them
+        saved = snapshot(index, refs, fresh, jobs)
         for digest, row in fresh.items():
             destination = Path(stage) / object_path(digest, row["local"])
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -564,12 +633,36 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
                 entry["reused_object"] = True
             index["assets"][row["key"]] = entry
             refs.setdefault(row["item_id"], []).append({"kind": kind, **entry})
+        staged = sorted(str(path.relative_to(stage)).replace("\\", "/")
+                        for path in Path(stage).rglob("*") if path.is_file())
+        offenders = [name for name in staged if misplaced(name)]
+        if offenders:
+            discard()
+            raise RuntimeError(f"media must be SHA-bucketed, state one level down; "
+                               f"offenders: {offenders[:5]}")
         stage_state(stage, index, refs, kind, budget, len(fresh))
         # one commit: the batch's media files AND the resume state AND the budget report
-        commit = api.upload_folder(repo_id=REPO, repo_type="dataset", folder_path=stage,
-                                   path_in_repo=".", revision=WRITE_REVISION,
-                                   commit_message=f"{kind}: {len(fresh)} objects + resume state "
-                                                  f"(batch {batch_number})")
+        try:
+            commit = api.upload_folder(repo_id=REPO, repo_type="dataset", folder_path=stage,
+                                       path_in_repo=".", revision=WRITE_REVISION,
+                                       commit_message=f"{kind}: {len(fresh)} objects + resume "
+                                                      f"state (batch {batch_number})")
+        except Exception as error:
+            # nothing landed, so the resume state must not remember this batch either:
+            # an entry may only claim bytes the repository already holds
+            rollback(index, refs, saved)
+            discard()
+            dirty = False
+            waited = looks_like_quota(str(error))
+            refused = f"commit refused by the hub ({'quota' if waited else type(error).__name__})"
+            budget.stop_reason = f"{refused}: {str(error)[:300]}"
+            history.append({"batch": batch_number, "refused": refused, "error": str(error)[:500],
+                            "rate_window": budget.state, "rolled_back_objects": len(fresh),
+                            "rolled_back_assets": len(jobs)})
+            if waited:
+                save_backoff(api, kind, budget)  # sleep until the window resets, then resume
+            log(budget.stop_reason)
+            break
         budget.files += len(fresh) + 4
         budget.bytes += sum(row["bytes"] for row in fresh.values())
         remote = remote_oids(api, sorted({object_path(r["sha256"], r["local"]) for r in jobs}))
@@ -585,7 +678,7 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
                 continue
             index["assets"][row["key"]]["status"] = "verified_remote"
             verified += 1
-        shutil.rmtree(stage, ignore_errors=True)
+        discard()
         remaining = sum(1 for item_id, url in queue if not done(f"{item_id}:{kind}:{url}", index))
         checkpoint = {"commit": getattr(commit, "commit_url", "") or str(commit)[:60],
                       "objects": len(index["objects"]), "queue_remaining": remaining}
@@ -625,6 +718,7 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
         except Exception as error:
             log(f"final state publish failed: {error}")
     return {"kind": kind, "queue_assets": len(queue), "batches": history,
+            "refused": refused,
             "objects_total": len(index["objects"]),
             "asset_lines": len(index["assets"]),
             "by_status": dict(Counter(a["status"] for a in index["assets"].values())),
@@ -724,8 +818,6 @@ def main() -> int:
                         help="distinct new objects per commit, state included in the same commit")
     parser.add_argument("--max-commits-per-run", type=int,
                         default=int(os.environ.get("MAX_COMMITS_PER_RUN", "30")))
-    parser.add_argument("--max-commits-per-day", type=int,
-                        default=int(os.environ.get("MAX_COMMITS_PER_DAY", "120")))
     parser.add_argument("--min-commit-interval", type=float, default=20.0,
                         help="minimum seconds between commits (pacing)")
     parser.add_argument("--min-remaining", type=int, default=150,
@@ -734,10 +826,10 @@ def main() -> int:
     args = parser.parse_args()
     report = run(args.kind, args.batches, args.batch_assets, args.workers,
                  args.max_minutes, args.dry_run, args.reserve_minutes, args.commit_files,
-                 args.max_commits_per_run, args.max_commits_per_day, args.min_commit_interval,
-                 args.min_remaining)
+                 args.max_commits_per_run, args.min_commit_interval, args.min_remaining)
     print(json.dumps(report, ensure_ascii=False, indent=1))
-    return 0
+    # a hub refusal is a failure, never a quiet green step
+    return 1 if report.get("refused") else 0
 
 
 if __name__ == "__main__":

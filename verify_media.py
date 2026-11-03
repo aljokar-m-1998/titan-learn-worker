@@ -63,9 +63,7 @@ def verify(kind: str, publish: bool, recent: int = 0) -> dict:
     remote = remote_oids(api, paths)
     match = mismatch = 0
     offenders: list[str] = []
-    for digest, obj in objects.items():
-        if obj.get("kind") != kind:
-            continue
+    for digest, obj in of_kind.items():
         actual_sha, actual_bytes = remote.get(obj["object"], ("", 0))
         if actual_sha.lower() == obj["sha256"] and (not actual_bytes or int(actual_bytes) == obj["bytes"]):
             match += 1
