@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -218,7 +219,11 @@ def done(key: str, index: dict) -> bool:
 
 
 def video_gate_allowed(api) -> tuple[bool, str]:
-    """Video may not start until a representative size sample exists in the dataset."""
+    """Video waits for two things: a measured size sample, and audio finished + verified.
+
+    Both are read from the dataset, so the ordering is enforced by evidence on the shared
+    store rather than by a human remembering to wait.
+    """
     raw = read_file(api, "reports/video_probe.json", revision=STATE_REVISION)
     if not raw:
         return False, "no reports/video_probe.json in the dataset"
@@ -228,11 +233,42 @@ def video_gate_allowed(api) -> tuple[bool, str]:
         return False, f"sample too small: {ok_count} successful HEADs"
     if probe.get("decision") != "video archiving may start":
         return False, f"sample says: {probe.get('decision')}"
-    return True, f"gate open on {ok_count} HEADs, mean {(probe.get('size_mb') or {}).get('mean')} MB"
+    check = read_file(api, "reports/audio_verify.json", revision=STATE_REVISION)
+    if not check:
+        return False, "audio is not verified yet: no reports/audio_verify.json"
+    verdict = json.loads(check)
+    if not verdict.get("integrity_ok"):
+        return False, ("audio verification found integrity problems: "
+                       f"{verdict.get('indexed_missing_or_mismatch')} objects, "
+                       f"{verdict.get('dangling_refs')} dangling refs")
+    if not verdict.get("complete"):
+        return False, (f"audio not finished: {verdict.get('audio_queue_remaining')} assets pending, "
+                       f"{verdict.get('remote_orphans_not_indexed')} objects not yet accounted for")
+    return True, (f"gate open on {ok_count} HEADs; audio complete and verified "
+                  f"{verdict.get('indexed_ok')} objects / {verdict.get('bytes_gb')} GB")
+
+
+class Stopped(Exception):
+    """The runner is about to end this job; the checkpoint gets written before it does."""
+
+
+def _on_signal(signum, frame):
+    """A runner winding down still gets its checkpoint written before the process leaves."""
+    print(f"signal {signum}: flushing checkpoint before exit", file=sys.stderr, flush=True)
+    if STATE_HOOK and not STATE_HOOK.get("dry_run"):
+        try:
+            write_state(STATE_HOOK["api"], STATE_HOOK["index"], STATE_HOOK["refs"],
+                        STATE_HOOK["kind"])
+        except Exception as error:
+            print(f"checkpoint flush failed: {error}", file=sys.stderr, flush=True)
+    raise SystemExit(128 + signum)
+
+
+STATE_HOOK: dict = {}
 
 
 def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: float,
-        dry_run: bool) -> dict:
+        dry_run: bool, reserve_minutes: float = 10.0) -> dict:
     api = hf_api()
     if kind == "video":
         allowed, why = video_gate_allowed(api)
@@ -241,12 +277,20 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
     index = load_state(api)
     refs = load_refs(api)
     queue = queue_from_shards(api, kind)
+    STATE_HOOK.clear()
+    STATE_HOOK.update({"api": api, "index": index, "refs": refs, "kind": kind, "dry_run": dry_run})
     log(f"{kind}: queue {len(queue)} assets, index has {len(index['objects'])} objects")
     started = time.time()
     history: list[dict] = []
+    last_batch_seconds = 0.0
     for batch_number in range(1, batches + 1):
-        if (time.time() - started) / 60 > max_minutes:
-            history.append({"batch": batch_number, "skipped": "time budget reached"})
+        # the margin is adaptive: a batch only starts if the measured length of the last
+        # one still fits, plus a reserve, before this step's deadline
+        if (time.time() - started) + last_batch_seconds + reserve_minutes * 60 > max_minutes * 60:
+            history.append({"batch": batch_number, "skipped": "safety margin before the deadline",
+                            "elapsed_minutes": round((time.time() - started) / 60, 1),
+                            "last_batch_minutes": round(last_batch_seconds / 60, 1),
+                            "deadline_minutes": max_minutes, "reserve_minutes": reserve_minutes})
             break
         pending = [(item_id, url) for item_id, url in queue
                    if not done(f"{item_id}:{kind}:{url}", index)]
@@ -254,6 +298,7 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
             history.append({"batch": batch_number, "drained": True, "assets": 0})
             break
         slice_ = pending[:batch_assets]
+        batch_start = time.time()
         stage = tempfile.mkdtemp(prefix=f"voa-{kind}-")
         jobs: list[dict] = []
         with futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -313,8 +358,9 @@ def run(kind: str, batches: int, batch_assets: int, workers: int, max_minutes: f
                         "bytes_archived_mb": round(sum(o["bytes"] for o in index["objects"].values()) / 1048576, 1),
                         "cache_dir_removed": True})
         history.append(outcome)
+        last_batch_seconds = time.time() - batch_start
         log(f"batch {batch_number}: {verified}/{len(jobs)} verified remote, "
-            f"{remaining} assets still pending")
+            f"{remaining} assets still pending, {round(last_batch_seconds / 60, 1)} min")
         if verified == 0 and not fresh:
             history.append({"stop": "no progress in this batch; check the failures"})
             break
@@ -349,17 +395,25 @@ def write_state(api, index: dict, refs: dict[str, list[dict]], kind: str) -> Non
     shutil.rmtree(stage, ignore_errors=True)
 
 
+class Stopped(Exception):
+    """Kept as the named reason for an interrupted run; signals exit through _on_signal."""
+
+
 def main() -> int:
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     parser = argparse.ArgumentParser()
     parser.add_argument("--kind", default="audio", choices=("audio", "video", "pdf"))
     parser.add_argument("--batches", type=int, default=1)
     parser.add_argument("--batch-assets", type=int, default=400)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-minutes", type=float, default=55.0)
+    parser.add_argument("--reserve-minutes", type=float, default=10.0,
+                        help="time kept back so a batch finishes and checkpoints before the deadline")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     report = run(args.kind, args.batches, args.batch_assets, args.workers,
-                 args.max_minutes, args.dry_run)
+                 args.max_minutes, args.dry_run, args.reserve_minutes)
     print(json.dumps(report, ensure_ascii=False, indent=1))
     return 0
 

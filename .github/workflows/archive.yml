@@ -82,15 +82,27 @@ jobs:
           python worker.py --kind audio \
             --batches "${{ github.event.inputs.batches || '12' }}" \
             --batch-assets "${{ github.event.inputs.batch_assets || '500' }}" \
-            --workers 8 --max-minutes 145 | tee audio-run.json
+            --workers 8 --max-minutes 118 --reserve-minutes 15 | tee audio-run.json
 
-      - name: archive video (refuses unless the size sample is in the dataset)
+      - name: verify audio independently (publishes reports/audio_verify.json)
+        if: ${{ github.event.inputs.kinds != 'video' }}
+        run: |
+          python verify_media.py --kind audio | tee audio-verify.json
+        # a non-zero exit here means an indexed object is absent or differs remotely,
+        # which stops the job before any video bytes get pulled
+
+      - name: archive video (needs the size sample AND audio verified + drained)
         if: ${{ github.event.inputs.kinds != 'audio' }}
         run: |
           python worker.py --kind video \
             --batches "${{ github.event.inputs.batches || '12' }}" \
             --batch-assets "${{ github.event.inputs.batch_assets || '300' }}" \
-            --workers 6 --max-minutes 145 | tee video-run.json
+            --workers 6 --max-minutes 100 --reserve-minutes 15 | tee video-run.json
+
+      - name: verify video independently (publishes reports/video_verify.json)
+        if: ${{ github.event.inputs.kinds != 'audio' }}
+        run: |
+          python verify_media.py --kind video | tee video-verify.json
 
       - name: upload this run's report
         if: always()
@@ -99,7 +111,9 @@ jobs:
           name: archive-run-${{ github.run_number }}
           path: |
             audio-run.json
+            audio-verify.json
             video-run.json
+            video-verify.json
           if-no-files-found: ignore
 
       - name: show where the queue stands
