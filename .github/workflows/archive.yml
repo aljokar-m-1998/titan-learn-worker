@@ -1,0 +1,113 @@
+name: archive VOA media into the dataset
+
+# Runs off this machine and off the Titan Gateway: GitHub's own runners pull from VOA,
+# verify MIME + size + SHA-256, upload to the dataset, re-verify remotely, then purge.
+# Audio and video run sequentially in ONE job because they share `_worker/media_index.json`;
+# two parallel writers would overwrite each other's resume state.
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      kinds:
+        description: "which media to archive this run"
+        required: false
+        default: "audio,video"
+        type: choice
+        options:
+          - audio,video
+          - audio
+          - video
+      batch_assets:
+        description: "assets per batch"
+        required: false
+        default: "500"
+      batches:
+        description: "batches per kind"
+        required: false
+        default: "12"
+
+concurrency:
+  group: voa-media-archiver
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_LEARN_DATASET_REPO: ${{ vars.HF_LEARN_DATASET_REPO || 'M-hv1/Titan-Learn' }}
+      HF_LEARN_DATASET_REVISION: ${{ vars.HF_LEARN_STATE_REVISION || 'staging' }}
+      HF_LEARN_DATASET_PIN: ${{ vars.HF_LEARN_RECORDS_PIN || 'c1680e48da3963d1f24196da26b02a4152982f0e' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install only what the archiver needs
+        run: python -m pip install --no-cache-dir --upgrade huggingface_hub pyarrow
+
+      - name: prove the token and the pinned records are readable
+        run: |
+          python - <<'PY'
+          import json, os
+          from huggingface_hub import HfApi, hf_hub_download
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          repo = os.environ["HF_LEARN_DATASET_REPO"]
+          info = api.repo_info(repo, repo_type="dataset")
+          print("repo", repo, "private", info.private)
+          manifest = json.loads(hf_hub_download(repo_id=repo, repo_type="dataset", filename="manifest.json",
+                                                revision=os.environ["HF_LEARN_DATASET_PIN"], token=os.environ["HF_TOKEN"],
+                                                cache_dir="/tmp/hfc"))
+          print("records at pin:", manifest["accepted"], "| shards", len(manifest["shards"]), "|", manifest["format"])
+          PY
+
+      - name: archive audio (resumes from _worker state; skips verified assets)
+        if: ${{ github.event.inputs.kinds != 'video' }}
+        run: |
+          python worker.py --kind audio \
+            --batches "${{ github.event.inputs.batches || '12' }}" \
+            --batch-assets "${{ github.event.inputs.batch_assets || '500' }}" \
+            --workers 8 --max-minutes 145 | tee audio-run.json
+
+      - name: archive video (refuses unless the size sample is in the dataset)
+        if: ${{ github.event.inputs.kinds != 'audio' }}
+        run: |
+          python worker.py --kind video \
+            --batches "${{ github.event.inputs.batches || '12' }}" \
+            --batch-assets "${{ github.event.inputs.batch_assets || '300' }}" \
+            --workers 6 --max-minutes 145 | tee video-run.json
+
+      - name: upload this run's report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-run-${{ github.run_number }}
+          path: |
+            audio-run.json
+            video-run.json
+          if-no-files-found: ignore
+
+      - name: show where the queue stands
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os
+          from huggingface_hub import hf_hub_download
+          repo = os.environ["HF_LEARN_DATASET_REPO"]
+          path = hf_hub_download(repo_id=repo, repo_type="dataset", filename="_worker/media_index.json",
+                                 revision=os.environ["HF_LEARN_DATASET_REVISION"], token=os.environ["HF_TOKEN"],
+                                 cache_dir="/tmp/hfc")
+          index = json.load(open(path, encoding="utf-8"))
+          from collections import Counter
+          print("objects archived:", len(index["objects"]))
+          print("bytes:", round(sum(o["bytes"] for o in index["objects"].values()) / 1073741824, 2), "GB")
+          print("assets by status:", dict(Counter(a["status"] for a in index["assets"].values())))
+          PY
