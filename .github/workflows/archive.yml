@@ -38,6 +38,10 @@ on:
         description: "parallel pulls per wave"
         required: false
         default: "8"
+      reserve_minutes:
+        description: "time kept back so a batch checkpoints before the step deadline"
+        required: false
+        default: "15"
       max_minutes:
         description: "wall-clock limit for the audio step, so a test run can be short"
         required: false
@@ -105,7 +109,7 @@ jobs:
             --batch-assets "${{ github.event.inputs.batch_assets || '400' }}" \
             --workers "${{ github.event.inputs.workers || '8' }}" \
             --max-minutes "${{ github.event.inputs.max_minutes || '118' }}" \
-            --reserve-minutes 15 \
+            --reserve-minutes "${{ github.event.inputs.reserve_minutes || '15' }}" \
             --min-commit-interval 25 --min-remaining 150 \
             --max-commits-per-run "${{ vars.MAX_COMMITS_PER_RUN || '30' }}" | tee audio-run.json
 
