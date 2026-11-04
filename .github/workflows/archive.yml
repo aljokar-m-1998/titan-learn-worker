@@ -6,11 +6,11 @@ name: archive VOA media into the dataset
 # two parallel writers would overwrite each other's resume state.
 
 on:
-  # PAUSED 2026-11-04: av.voanews.com is answering 403 for 420 assets at attempts=2, and one
-  # more scheduled run would turn a temporary block into 420 terminal records. Resume after the
-  # single manual run the owner ordered. Nothing about the layout or the verification changed.
-  # schedule:
-  #   - cron: "23 */2 * * *"
+  # Resumed 2026-11-04 after audio completed and the independent full audit came back
+  # complete=true with missing=0, checksum_mismatch=0, dangling_refs=0 and
+  # remote_orphans_not_indexed=0. Scheduled runs now carry the video phase to the end.
+  schedule:
+    - cron: "23 */2 * * *"
   workflow_dispatch:
     inputs:
       kinds:
