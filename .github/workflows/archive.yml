@@ -6,11 +6,12 @@ name: archive VOA media into the dataset
 # two parallel writers would overwrite each other's resume state.
 
 on:
-  # Resumed 2026-11-04 after audio completed and the independent full audit came back
-  # complete=true with missing=0, checksum_mismatch=0, dangling_refs=0 and
-  # remote_orphans_not_indexed=0. Scheduled runs now carry the video phase to the end.
-  schedule:
-    - cron: "23 */2 * * *"
+  # Both media phases are drained (audio 32,344 assets and video 9,417 assets, each with
+  # independent scope:full audits at complete=true) and the terminal ledger is published, so a
+  # scheduled run would now only write empty state commits. Parked, not deleted: one line to
+  # re-enable if any asset ever needs re-archiving.
+  # schedule:
+  #   - cron: "23 */2 * * *"
   workflow_dispatch:
     inputs:
       kinds:
