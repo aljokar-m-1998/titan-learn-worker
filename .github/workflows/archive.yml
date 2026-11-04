@@ -6,10 +6,11 @@ name: archive VOA media into the dataset
 # two parallel writers would overwrite each other's resume state.
 
 on:
-  # Resumed 2026-11-03 after the root migration: every directory is bucketed by SHA-256, the
-  # flat copies are gone, and a test batch committed three clean batches under this code.
-  schedule:
-    - cron: "23 */2 * * *"
+  # PAUSED 2026-11-04: av.voanews.com is answering 403 for 420 assets at attempts=2, and one
+  # more scheduled run would turn a temporary block into 420 terminal records. Resume after the
+  # single manual run the owner ordered. Nothing about the layout or the verification changed.
+  # schedule:
+  #   - cron: "23 */2 * * *"
   workflow_dispatch:
     inputs:
       kinds:
